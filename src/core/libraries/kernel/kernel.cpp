@@ -298,6 +298,11 @@ s32 PS4_SYSV_ABI sceKernelGetAppInfo(s32 pid, OrbisKernelAppInfo* app_info) {
     return ORBIS_OK;
 }
 
+s32 PS4_SYSV_ABI sceNgs2VoiceControl() {
+    LOG_ERROR(Lib_Ngs2, "called");
+    return ORBIS_OK;
+}
+
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     service_thread = std::jthread{KernelServiceThread};
 
@@ -313,6 +318,7 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     Libraries::Kernel::RegisterDebug(sym);
 
     LIB_OBJ("f7uOxY9mM1U", "libkernel", 1, "libkernel", &g_stack_chk_guard);
+    LIB_FUNCTION("uu94irFOGpA", "libSceNgs2", 1, "libSceNgs2", sceNgs2VoiceControl);
     LIB_FUNCTION("D4yla3vx4tY", "libkernel", 1, "libkernel", sceKernelError);
     LIB_FUNCTION("YeU23Szo3BM", "libkernel", 1, "libkernel", sceKernelGetAllowedSdkVersionOnSystem);
     LIB_FUNCTION("Mv1zUObHvXI", "libkernel", 1, "libkernel", sceKernelGetSystemSwVersion);
