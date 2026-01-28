@@ -1,14 +1,20 @@
 // SPDX-FileCopyrightText: Copyright 2014 Citra Emulator Project
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <mutex>
 #include <thread>
+#include <vector>
+#include <memory>
+#include <optional>
 
 #include <fmt/format.h>
 
 #ifdef _WIN32
-#include <windows.h> // For OutputDebugStringW
+#include <windows.h>
 #endif
 
 #include "common/bounded_threadsafe_queue.h"
@@ -18,279 +24,462 @@
 #include "common/logging/backend.h"
 #include "common/logging/log.h"
 #include "common/logging/log_entry.h"
-#include "common/logging/text_formatter.h"
 #include "common/path_util.h"
 #include "common/string_util.h"
 #include "common/thread.h"
 
 namespace Common::Log {
-
 using namespace Common::FS;
 
 namespace {
 
-/**
- * Backend that writes to stderr and with color
- */
-class ColorConsoleBackend {
+std::atomic_bool g_suppress_logging{true};
+
+/* =========================
+   Log Entry (IMPROVED)
+   ========================= */
+struct LogEntry {
+    bool valid{false};
+
+    std::chrono::microseconds timestamp;
+    Class log_class;
+    Level log_level;
+
+    const char* filename{};
+    unsigned int line{};
+    const char* function{};
+
+    const char* format{};
+    // Store arguments safely for async logging
+    fmt::dynamic_format_arg_store<fmt::format_context> args_store;
+
+    std::string thread;
+    
+    // Pre-formatted message for sync mode
+    std::optional<std::string> formatted_message;
+};
+
+/* =========================
+   Backend Interface
+   ========================= */
+struct ILogBackend {
+    virtual ~ILogBackend() = default;
+    virtual void Write(const LogEntry&) = 0;
+    virtual void Flush() = 0;
+};
+
+/* =========================
+   Lazy Formatter (with exception handling)
+   ========================= */
+inline std::string FormatLazy(const LogEntry& entry) {
+    // Use pre-formatted message if available (sync mode)
+    if (entry.formatted_message.has_value()) {
+        return *entry.formatted_message;
+    }
+
+    try {
+        std::string message = fmt::vformat(entry.format, entry.args_store);
+        return fmt::format(
+            "[{:>8}][{:>7}][{}:{} {}] {}",
+            GetLogClassName(entry.log_class),
+            GetLevelName(entry.log_level),
+            entry.filename ? entry.filename : "?",
+            entry.line,
+            entry.function ? entry.function : "?",
+            message);
+    } catch (const fmt::format_error& e) {
+        return fmt::format(
+            "[{:>8}][{:>7}][{}:{} {}] [FORMAT ERROR: {}]",
+            GetLogClassName(entry.log_class),
+            GetLevelName(entry.log_level),
+            entry.filename ? entry.filename : "?",
+            entry.line,
+            entry.function ? entry.function : "?",
+            e.what());
+    }
+}
+
+/* =========================
+   Color Console Backend
+   ========================= */
+class ColorConsoleBackend final : public ILogBackend {
 public:
-    explicit ColorConsoleBackend() = default;
-
-    ~ColorConsoleBackend() = default;
-
-    void Write(const Entry& entry) {
-        if (enabled.load(std::memory_order_relaxed)) {
-            PrintColoredMessage(entry);
+    void Write(const LogEntry& entry) override {
+        if (!enabled.load(std::memory_order_relaxed)) {
+            return;
         }
+
+        PrintColoredMessage(entry.log_level, FormatLazy(entry));
     }
 
-    void Flush() {
-        // stderr shouldn't be buffered
-    }
+    void Flush() override {}
 
-    void SetEnabled(bool enabled_) {
-        enabled = enabled_;
+    void SetEnabled(bool value) {
+        enabled.store(value, std::memory_order_relaxed);
     }
 
 private:
     std::atomic_bool enabled{true};
 };
 
-/**
- * Backend that writes to a file passed into the constructor
- */
-class FileBackend {
+/* =========================
+   File Backend (IMPROVED)
+   ========================= */
+class FileBackend final : public ILogBackend {
 public:
-    explicit FileBackend(const std::filesystem::path& filename, bool should_append = false)
-        : file{filename, should_append ? FS::FileAccessMode::Append : FS::FileAccessMode::Create,
-               FS::FileType::TextFile} {}
+    FileBackend(const std::filesystem::path& filename, bool append)
+        : file(filename,
+               append ? FileAccessMode::Append : FileAccessMode::Create,
+               FileType::TextFile),
+          base_filename(filename) {}
 
-    ~FileBackend() = default;
+    void Write(const LogEntry& entry) override {
+        std::lock_guard lock(mutex);
 
-    void Write(const Entry& entry) {
         if (!enabled) {
             return;
         }
 
-        bytes_written += file.WriteString(FormatLogMessage(entry).append(1, '\n'));
+        std::string formatted = FormatLazy(entry);
+        bytes_written += file.WriteString(formatted.append(1, '\n'));
 
-        // Prevent logs from exceeding a set maximum size in the event that log entries are spammed.
-        const auto write_limit = 100_MB;
-        const bool write_limit_exceeded = bytes_written > write_limit;
-        if (entry.log_level >= Level::Error || write_limit_exceeded) {
-            if (write_limit_exceeded) {
-                // Stop writing after the write limit is exceeded.
-                // Don't close the file so we can print a stacktrace if necessary
-                enabled = false;
+        constexpr auto write_limit = 100_MB;
+        const bool should_flush = bytes_written > write_limit || 
+                                 entry.log_level >= Level::Error;
+
+        if (should_flush) {
+            if (bytes_written > write_limit) {
+                RotateLogFile();
             }
             file.Flush();
         }
     }
 
-    void Flush() {
+    void Flush() override {
+        std::lock_guard lock(mutex);
         file.Flush();
     }
 
 private:
-    Common::FS::IOFile file;
-    bool enabled = true;
-    std::size_t bytes_written = 0;
-};
-
-/**
- * Backend that writes to Visual Studio's output window
- */
-class DebuggerBackend {
-public:
-    explicit DebuggerBackend() = default;
-
-    ~DebuggerBackend() = default;
-
-    void Write(const Entry& entry) {
-#ifdef _WIN32
-        ::OutputDebugStringW(UTF8ToUTF16W(FormatLogMessage(entry).append(1, '\n')).c_str());
-#endif
-    }
-
-    void Flush() {}
-
-    void EnableForStacktrace() {}
-};
-
-bool initialization_in_progress_suppress_logging = true;
-
-/**
- * Static state as a singleton.
- */
-class Impl {
-public:
-    static Impl& Instance() {
-        if (!instance) {
-            throw std::runtime_error("Using Logging instance before its initialization");
-        }
-        return *instance;
-    }
-
-    static void Initialize(std::string_view log_file) {
-        if (instance) {
-            LOG_WARNING(Log, "Reinitializing logging backend");
-            return;
-        }
-        const auto& log_dir = GetUserPath(PathType::LogDir);
-        std::filesystem::create_directory(log_dir);
-        Filter filter;
-        filter.ParseFilterString(Config::getLogFilter());
-        const auto& log_file_path = log_file.empty() ? LOG_FILE : log_file;
-        instance = std::unique_ptr<Impl, decltype(&Deleter)>(
-            new Impl(log_dir / log_file_path, filter), Deleter);
-        initialization_in_progress_suppress_logging = false;
-    }
-
-    static void ResetInstance() {
-        initialization_in_progress_suppress_logging = true;
-        instance.reset();
-    }
-
-    static bool IsActive() {
-        return instance != nullptr;
-    }
-
-    static void Start() {
-        instance->StartBackendThread();
-    }
-
-    static void Stop() {
-        instance->StopBackendThread();
-    }
-
-    static void SetAppend() {
-        should_append = true;
-    }
-
-    Impl(const Impl&) = delete;
-    Impl& operator=(const Impl&) = delete;
-
-    Impl(Impl&&) = delete;
-    Impl& operator=(Impl&&) = delete;
-
-    void SetGlobalFilter(const Filter& f) {
-        filter = f;
-    }
-
-    void SetColorConsoleBackendEnabled(bool enabled) {
-        color_console_backend.SetEnabled(enabled);
-    }
-
-    void PushEntry(Class log_class, Level log_level, const char* filename, unsigned int line_num,
-                   const char* function, const char* format, const fmt::format_args& args) {
-        if (!filter.CheckMessage(log_class, log_level) || !Config::getLoggingEnabled()) {
+    void RotateLogFile() {
+        if (!enabled) {
             return;
         }
 
-        const auto message = fmt::vformat(format, args);
+        // Log warning before rotation
+        try {
+            file.WriteString("[WARNING] Log file size limit reached, rotating...\n");
+            file.Flush();
+            file.Close();
 
-        // Propagate important log messages to the profiler
-        if (IsProfilerConnected()) {
-            const auto& msg_str = fmt::format("[{}] {}", GetLogClassName(log_class), message);
-            switch (log_level) {
-            case Level::Warning:
-                TRACE_WARN(msg_str);
-                break;
-            case Level::Error:
-                TRACE_ERROR(msg_str);
-                break;
-            case Level::Critical:
-                TRACE_CRIT(msg_str);
-                break;
-            default:
-                break;
-            }
-        }
+            // Rename old file with timestamp
+            auto timestamp = std::chrono::system_clock::now();
+            auto time_t = std::chrono::system_clock::to_time_t(timestamp);
+            
+            auto old_path = base_filename;
+            auto new_path = base_filename;
+            new_path.replace_filename(
+                fmt::format("{}.{}.old", 
+                           base_filename.filename().string(),
+                           time_t));
 
-        using std::chrono::duration_cast;
-        using std::chrono::microseconds;
-        using std::chrono::steady_clock;
+            std::filesystem::rename(base_filename, new_path);
 
-        const Entry entry = {
-            .timestamp = duration_cast<microseconds>(steady_clock::now() - time_origin),
-            .log_class = log_class,
-            .log_level = log_level,
-            .filename = filename,
-            .line_num = line_num,
-            .function = function,
-            .message = std::move(message),
-        };
-        if (Config::getLogType() == "async") {
-            message_queue.EmplaceWait(entry);
-        } else {
-            ForEachBackend([&entry](auto& backend) { backend.Write(entry); });
-            std::fflush(stdout);
+            // Create new file
+            file.Open(base_filename, FileAccessMode::Create, FileType::TextFile);
+            bytes_written = 0;
+            
+        } catch (const std::exception& e) {
+            // If rotation fails, disable logging to prevent issues
+            enabled = false;
+            fmt::print(stderr, "Failed to rotate log file: {}\n", e.what());
         }
     }
 
 private:
-    Impl(const std::filesystem::path& file_backend_filename, const Filter& filter_)
-        : filter{filter_}, file_backend{file_backend_filename, should_append} {}
+    IOFile file;
+    std::filesystem::path base_filename;
+    bool enabled{true};
+    std::size_t bytes_written{0};
+    std::mutex mutex;
+};
 
-    ~Impl() = default;
+#ifdef _WIN32
+/* =========================
+   Debugger Backend
+   ========================= */
+class DebuggerBackend final : public ILogBackend {
+public:
+    void Write(const LogEntry& entry) override {
+        ::OutputDebugStringW(
+            UTF8ToUTF16W(FormatLazy(entry).append(1, '\n')).c_str());
+    }
 
-    void StartBackendThread() {
-        backend_thread = std::jthread([this](std::stop_token stop_token) {
+    void Flush() override {}
+};
+#endif
+
+/* =========================
+   Logger Implementation (IMPROVED)
+   ========================= */
+class Impl {
+public:
+    // Non-copyable, non-movable
+    Impl(const Impl&) = delete;
+    Impl& operator=(const Impl&) = delete;
+    Impl(Impl&&) = delete;
+    Impl& operator=(Impl&&) = delete;
+
+    static Impl* Instance() {
+        return instance.load(std::memory_order_acquire);
+    }
+
+    static void Initialize(std::string_view log_file, bool append) {
+        std::call_once(init_flag, [&] {
+            const auto& log_dir = GetUserPath(PathType::LogDir);
+            std::filesystem::create_directories(log_dir);
+
+            Filter filter;
+            filter.ParseFilterString(Config::getLogFilter());
+
+            auto new_instance = new Impl(log_dir / log_file, filter, append);
+            instance.store(new_instance, std::memory_order_release);
+            
+            g_suppress_logging.store(false, std::memory_order_release);
+        });
+    }
+
+    static void Shutdown() {
+        g_suppress_logging.store(true, std::memory_order_release);
+        
+        // Ensure no new logs are accepted before destroying instance
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        
+        Impl* inst = instance.exchange(nullptr, std::memory_order_acq_rel);
+        if (inst) {
+            inst->Stop();
+            delete inst;
+        }
+        
+        // Reset init flag for potential re-initialization
+        init_flag.~once_flag();
+        new (&init_flag) std::once_flag();
+    }
+
+    static bool IsActive() {
+        return instance.load(std::memory_order_acquire) != nullptr;
+    }
+
+    void Push(Class log_class, Level level,
+              const char* filename, unsigned int line,
+              const char* function,
+              const char* format,
+              const fmt::format_args& args) {
+        
+        if (!filter.CheckMessage(log_class, level) ||
+            !logging_enabled.load(std::memory_order_relaxed)) {
+            return;
+        }
+
+        LogEntry entry{
+            .valid = true,
+            .timestamp = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - time_origin),
+            .log_class = log_class,
+            .log_level = level,
+            .filename = filename,
+            .line = line,
+            .function = function,
+            .format = format,
+            .thread = GetThreadName(),
+        };
+
+        // Store arguments safely for async mode
+        entry.args_store = fmt::dynamic_format_arg_store<fmt::format_context>();
+        fmt::vformat_to(std::back_inserter(entry.args_store), format, args);
+
+        if (is_async.load(std::memory_order_relaxed)) {
+            queue.EmplaceWait(std::move(entry));
+        } else {
+            // Format once for all backends in sync mode
+            try {
+                std::string message = fmt::vformat(format, args);
+                entry.formatted_message = fmt::format(
+                    "[{:>8}][{:>7}][{}:{} {}] {}",
+                    GetLogClassName(log_class),
+                    GetLevelName(level),
+                    filename ? filename : "?",
+                    line,
+                    function ? function : "?",
+                    message);
+            } catch (const fmt::format_error& e) {
+                entry.formatted_message = fmt::format(
+                    "[{:>8}][{:>7}][{}:{} {}] [FORMAT ERROR: {}]",
+                    GetLogClassName(log_class),
+                    GetLevelName(level),
+                    filename ? filename : "?",
+                    line,
+                    function ? function : "?",
+                    e.what());
+            }
+            
+            WriteToBackends(entry);
+        }
+
+        // Update statistics
+        messages_logged.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void SetColorConsoleEnabled(bool enabled) {
+        if (color_console) {
+            color_console->SetEnabled(enabled);
+        }
+    }
+
+    void UpdateConfig() {
+        logging_enabled.store(Config::getLoggingEnabled(), std::memory_order_relaxed);
+        is_async.store(Config::getLogType() == "async", std::memory_order_relaxed);
+    }
+
+    // Statistics
+    std::size_t GetMessagesLogged() const {
+        return messages_logged.load(std::memory_order_relaxed);
+    }
+
+    std::size_t GetMessagesDropped() const {
+        return messages_dropped.load(std::memory_order_relaxed);
+    }
+
+private:
+    Impl(const std::filesystem::path& file,
+         const Filter& filter_,
+         bool append)
+        : filter(filter_) {
+
+        // Cache config values
+        logging_enabled.store(Config::getLoggingEnabled(), std::memory_order_relaxed);
+        is_async.store(Config::getLogType() == "async", std::memory_order_relaxed);
+
+#ifdef _WIN32
+        backends.emplace_back(std::make_unique<DebuggerBackend>());
+#endif
+        color_console = new ColorConsoleBackend();
+        backends.emplace_back(std::unique_ptr<ILogBackend>(color_console));
+        backends.emplace_back(std::make_unique<FileBackend>(file, append));
+
+        // Start automatically
+        Start();
+    }
+
+    ~Impl() {
+        Stop();
+    }
+
+    void Start() {
+        if (!is_async.load(std::memory_order_relaxed)) {
+            return; // No thread needed for sync mode
+        }
+
+        backend_thread = std::jthread([this](std::stop_token stop) {
             Common::SetCurrentThreadName("shadPS4:Log");
-            Entry entry;
-            const auto write_logs = [this, &entry]() {
-                ForEachBackend([&entry](auto& backend) { backend.Write(entry); });
-            };
-            while (!stop_token.stop_requested()) {
-                message_queue.PopWait(entry, stop_token);
-                if (entry.filename != nullptr) {
-                    write_logs();
+
+            LogEntry entry{};
+            while (!stop.stop_requested()) {
+                if (!queue.PopWait(entry, stop)) {
+                    continue;
+                }
+                if (entry.valid) {
+                    WriteToBackends(entry);
                 }
             }
-            // Drain the logging queue. Only writes out up to MAX_LOGS_TO_WRITE to prevent a
-            // case where a system is repeatedly spamming logs even on close.
-            int max_logs_to_write = filter.IsDebug() ? std::numeric_limits<s32>::max() : 100;
-            while (max_logs_to_write-- && message_queue.TryPop(entry)) {
-                write_logs();
+
+            // Drain queue with timeout during shutdown
+            auto deadline = std::chrono::steady_clock::now() + 
+                           std::chrono::seconds(5);
+            
+            while (std::chrono::steady_clock::now() < deadline && 
+                   queue.TryPop(entry)) {
+                if (entry.valid) {
+                    WriteToBackends(entry);
+                } else {
+                    messages_dropped.fetch_add(1, std::memory_order_relaxed);
+                }
             }
         });
     }
 
-    void StopBackendThread() {
-        backend_thread.request_stop();
+    void Stop() {
         if (backend_thread.joinable()) {
+            backend_thread.request_stop();
             backend_thread.join();
         }
-
-        ForEachBackend([](auto& backend) { backend.Flush(); });
+        FlushBackends();
     }
 
-    void ForEachBackend(auto lambda) {
-        // lambda(debugger_backend);
-        lambda(color_console_backend);
-        lambda(file_backend);
+    void WriteToBackends(const LogEntry& entry) {
+        for (auto& backend : backends) {
+            try {
+                backend->Write(entry);
+            } catch (const std::exception& e) {
+                // Prevent backend exceptions from crashing the logger
+                fmt::print(stderr, "Backend write error: {}\n", e.what());
+            }
+        }
     }
 
-    static void Deleter(Impl* ptr) {
-        delete ptr;
+    void FlushBackends() {
+        for (auto& backend : backends) {
+            try {
+                backend->Flush();
+            } catch (const std::exception& e) {
+                fmt::print(stderr, "Backend flush error: {}\n", e.what());
+            }
+        }
     }
 
-    static inline std::unique_ptr<Impl, decltype(&Deleter)> instance{nullptr, Deleter};
-    static inline bool should_append{false};
+    std::string GetThreadName() {
+        // Cache thread names to avoid repeated allocations
+        thread_local std::string cached_name = Common::GetCurrentThreadName();
+        return cached_name;
+    }
+
+private:
+    static inline std::atomic<Impl*> instance{nullptr};
+    static inline std::once_flag init_flag;
 
     Filter filter;
-    DebuggerBackend debugger_backend{};
-    ColorConsoleBackend color_console_backend{};
-    FileBackend file_backend;
+    std::vector<std::unique_ptr<ILogBackend>> backends;
+    ColorConsoleBackend* color_console{nullptr};
 
-    MPSCQueue<Entry> message_queue{};
-    std::chrono::steady_clock::time_point time_origin{std::chrono::steady_clock::now()};
+    MPSCQueue<LogEntry> queue;
+    std::chrono::steady_clock::time_point time_origin{
+        std::chrono::steady_clock::now()};
     std::jthread backend_thread;
+
+    // Cached config values
+    std::atomic_bool logging_enabled{true};
+    std::atomic_bool is_async{false};
+
+    // Statistics
+    std::atomic<std::size_t> messages_logged{0};
+    std::atomic<std::size_t> messages_dropped{0};
 };
+
 } // namespace
 
+/* =========================
+   Public API
+   ========================= */
 void Initialize(std::string_view log_file) {
-    Impl::Initialize(log_file.empty() ? LOG_FILE : log_file);
+    Impl::Initialize(log_file.empty() ? LOG_FILE : log_file, false);
+}
+
+void InitializeAppend(std::string_view log_file) {
+    Impl::Initialize(log_file.empty() ? LOG_FILE : log_file, true);
+}
+
+void Deinitialize() {
+    Impl::Shutdown();
 }
 
 bool IsActive() {
@@ -298,36 +487,52 @@ bool IsActive() {
 }
 
 void Start() {
-    Impl::Start();
+    // Now handled automatically in constructor
+    // Kept for API compatibility
 }
 
 void Stop() {
-    Impl::Stop();
-}
-
-void Denitializer() {
-    Impl::Stop();
-    Impl::ResetInstance();
-}
-
-void SetGlobalFilter(const Filter& filter) {
-    Impl::Instance().SetGlobalFilter(filter);
+    // Now handled automatically in destructor
+    // Kept for API compatibility
 }
 
 void SetColorConsoleBackendEnabled(bool enabled) {
-    Impl::Instance().SetColorConsoleBackendEnabled(enabled);
-}
-
-void SetAppend() {
-    Impl::SetAppend();
-}
-
-void FmtLogMessageImpl(Class log_class, Level log_level, const char* filename,
-                       unsigned int line_num, const char* function, const char* format,
-                       const fmt::format_args& args) {
-    if (!initialization_in_progress_suppress_logging) [[likely]] {
-        Impl::Instance().PushEntry(log_class, log_level, filename, line_num, function, format,
-                                   args);
+    if (auto* impl = Impl::Instance()) {
+        impl->SetColorConsoleEnabled(enabled);
     }
 }
+
+void UpdateConfiguration() {
+    if (auto* impl = Impl::Instance()) {
+        impl->UpdateConfig();
+    }
+}
+
+std::size_t GetMessagesLogged() {
+    if (auto* impl = Impl::Instance()) {
+        return impl->GetMessagesLogged();
+    }
+    return 0;
+}
+
+std::size_t GetMessagesDropped() {
+    if (auto* impl = Impl::Instance()) {
+        return impl->GetMessagesDropped();
+    }
+    return 0;
+}
+
+void FmtLogMessageImpl(Class log_class, Level level,
+                       const char* filename, unsigned int line,
+                       const char* function,
+                       const char* format,
+                       const fmt::format_args& args) {
+    if (!g_suppress_logging.load(std::memory_order_acquire)) {
+        if (auto* impl = Impl::Instance()) {
+            impl->Push(log_class, level, filename, line,
+                       function, format, args);
+        }
+    }
+}
+
 } // namespace Common::Log
